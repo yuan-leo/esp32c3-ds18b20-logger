@@ -11,6 +11,7 @@
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
+#include <esp_system.h>
 #include "dashboard.h"
 
 namespace {
@@ -26,6 +27,10 @@ constexpr size_t WRITE_BATCH = 12;          // Save every ~60 seconds to reduce 
 constexpr size_t SENSOR_QUEUE_DEPTH = 64;   // Keeps samples while exporting CSV
 constexpr size_t CHART_MAX_POINTS = 1100;
 constexpr char AP_PASSWORD[] = "TempLog1234";
+constexpr uint32_t BOOT_JOIN_GRACE_MS = 15000; // Recovery AP is accessible before joining home Wi-Fi.
+constexpr uint32_t STA_JOIN_TIMEOUT_MS = 22000;
+constexpr uint32_t AP_CHECK_INTERVAL_MS = 8000;
+constexpr char FIRMWARE_VERSION[] = "1.1.0-wifi-recovery";
 
 // The fixed 8-byte binary format must not be changed without a migration.
 struct __attribute__((packed)) Sample {
@@ -50,9 +55,23 @@ uint8_t activeSegment = 0;
 String apName, homeSsid, homePassword;
 volatile bool sensorPresent = false;
 volatile uint32_t dropped = 0;
-bool reconnectNeeded = false;
-uint32_t reconnectAt = 0;
-uint32_t nextWifiRetry = 0;
+volatile bool apRunning = false;
+volatile uint8_t lastStaDisconnectReason = 0;
+volatile uint32_t apStarts = 0;
+volatile uint32_t apStops = 0;
+uint32_t bootCount = 0;
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
+bool staConnecting = false;
+bool staRetryPending = false;
+bool staSuspended = false; // Don't endlessly disrupt SoftAP when home Wi-Fi is unavailable.
+uint32_t staJoinAt = 0;
+uint32_t staConnectStarted = 0;
+uint32_t lastApCheckAt = 0;
+uint32_t lastWifiLogAt = 0;
+
+void startStation();
+void enterApOnly(bool rememberFailure);
+void serviceWifi();
 
 String segmentName(uint8_t index) {
   char path[18];
