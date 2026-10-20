@@ -291,6 +291,16 @@ void onStatus() {
   body += ",\"ap_ssid\":" + jsonString(apName);
   body += ",\"ap_ip\":" + jsonString(WiFi.softAPIP().toString());
   body += ",\"dropped\":" + String(dropped);
+  body += ",\"firmware\":" + jsonString(FIRMWARE_VERSION);
+  body += ",\"boot_count\":" + String(bootCount);
+  body += ",\"reset_reason\":" + String((int)bootResetReason);
+  body += ",\"free_heap\":" + String(ESP.getFreeHeap());
+  body += ",\"min_free_heap\":" + String(ESP.getMinFreeHeap());
+  body += ",\"ap_running\":" + String(apRunning ? "true":"false");
+  body += ",\"ap_starts\":" + String(apStarts);
+  body += ",\"ap_stops\":" + String(apStops);
+  body += ",\"sta_suspended\":" + String(staSuspended ? "true":"false");
+  body += ",\"sta_disconnect_reason\":" + String(lastStaDisconnectReason);
   body += '}';
   responseJSON(body);
 }
@@ -407,8 +417,10 @@ void onSetWifi() {
   homePassword = pass;
   prefs.putString("ssid", homeSsid);
   prefs.putString("pwd", homePassword);
-  reconnectNeeded = true;
-  reconnectAt = millis() + 900;
+  staSuspended = false;
+  prefs.putBool("stafail", false);
+  staRetryPending = true;
+  staJoinAt = millis() + 6000;
   responseJSON("{\"ok\":true}");
 }
 
@@ -430,12 +442,73 @@ void onClearLog() {
   responseJSON("{\"ok\":true}");
 }
 
+void wifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_AP_START:
+      apRunning = true; ++apStarts;
+      Serial.println("[wifi] AP started"); break;
+    case ARDUINO_EVENT_WIFI_AP_STOP:
+      apRunning = false; ++apStops;
+      Serial.println("[wifi] AP stopped"); break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      staConnecting = false;
+      Serial.print("[wifi] Station IP: "); Serial.println(WiFi.localIP()); break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      lastStaDisconnectReason = info.wifi_sta_disconnected.reason;
+      Serial.printf("[wifi] STA disconnect reason=%u\n", lastStaDisconnectReason);
+      break;
+    default: break;
+  }
+}
+void enterApOnly(bool rememberFailure) {
+  Serial.println("[wifi] Switching to stable AP-only recovery mode");
+  staConnecting = false;
+  staRetryPending = false;
+  staSuspended = rememberFailure;
+  if (rememberFailure) prefs.putBool("stafail", true);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  if (!apRunning) {
+    WiFi.softAP(apName.c_str(), AP_PASSWORD, 1, 0, 4);
+  }
+}
 void startStation() {
-  if (homeSsid.isEmpty()) return;
-  WiFi.disconnect(false, false);
+  if (homeSsid.isEmpty() || staSuspended) return;
+  Serial.printf("[wifi] Trying home SSID: %s (22-sec limit)\n", homeSsid.c_str());
+  // Shared 2.4GHz radio: joining another-channel router WILL change SoftAP channel.
+  // On failure, restore stable AP-only channel 1 rather than retrying endlessly.
+  staRetryPending = false;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  if (!apRunning) WiFi.softAP(apName.c_str(), AP_PASSWORD, 1, 0, 4);
   WiFi.begin(homeSsid.c_str(), homePassword.c_str());
-  nextWifiRetry = millis() + 30000UL;
-  Serial.printf("Connecting to SSID: %s\n", homeSsid.c_str());
+  staConnecting = true;
+  staConnectStarted = millis();
+}
+void serviceWifi() {
+  uint32_t now = millis();
+  if (staRetryPending && static_cast<int32_t>(now-staJoinAt)>=0) startStation();
+  if (staConnecting && WiFi.status()==WL_CONNECTED) {
+    staConnecting = false; prefs.putBool("stafail", false);
+    Serial.println("[wifi] Station connected, AP stays active on shared channel");
+  }
+  if (staConnecting && (uint32_t)(now-staConnectStarted)>STA_JOIN_TIMEOUT_MS) {
+    Serial.printf("[wifi] Station timed out; disconnect reason=%u\n",lastStaDisconnectReason);
+    enterApOnly(true);
+  }
+  if ((uint32_t)(now-lastApCheckAt)>AP_CHECK_INTERVAL_MS) {
+    lastApCheckAt=now;
+    if (!apRunning && WiFi.getMode()!=WIFI_MODE_NULL) {
+      Serial.println("[wifi] Restoring missing AP");
+      WiFi.softAP(apName.c_str(), AP_PASSWORD, 1, 0, 4);
+    }
+    if ((uint32_t)(now-lastWifiLogAt)>30000) {
+      lastWifiLogAt=now;
+      Serial.printf("[diag] uptime=%lus freeHeap=%u minHeap=%u AP=%d STA=%d RSSI=%d reset=%d\n",
+        millis()/1000UL, ESP.getFreeHeap(), ESP.getMinFreeHeap(), apRunning,
+        WiFi.status()==WL_CONNECTED, WiFi.RSSI(), (int)bootResetReason);
+    }
+  }
 }
 
 void setupWebserver() {
@@ -460,7 +533,11 @@ void setup() {
   delay(200);
   Serial.println("\nESP32-C3 DS18B20 offline temperature logger starting");
 
+  bootResetReason=esp_reset_reason();
   prefs.begin("templog", false);
+  bootCount=prefs.getUInt("boots",0)+1;
+  prefs.putUInt("boots",bootCount);
+  Serial.printf("[boot] count=%lu reset_reason=%d freeHeap=%u\n",(unsigned long)bootCount,(int)bootResetReason,ESP.getFreeHeap());
   activeSegment = prefs.getUChar("seg", 0);
   if (activeSegment >= SEGMENT_COUNT) activeSegment = 0;
   homeSsid = prefs.getString("ssid", "");
@@ -479,16 +556,23 @@ void setup() {
   snprintf(hotspot, sizeof(hotspot), "TempLogger-%06lX",
            static_cast<unsigned long>(ESP.getEfuseMac() & 0xFFFFFFUL));
   apName = hotspot;
-  WiFi.mode(WIFI_AP_STA);
+  WiFi.onEvent(wifiEvent);
+  WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
   WiFi.setHostname("temp-logger");
-  if (!WiFi.softAP(apName.c_str(), AP_PASSWORD)) {
+  if (!WiFi.softAP(apName.c_str(), AP_PASSWORD, 1, 0, 4)) {
     Serial.println("ERROR: Could not create access point");
   }
   Serial.printf("Wi-Fi SSID: %s | password: %s | URL: http://%s/\n",
                 apName.c_str(), AP_PASSWORD, WiFi.softAPIP().toString().c_str());
-  startStation();
-  if (!homeSsid.isEmpty()) configTime(0, 0, "pool.ntp.org", "time.google.com");
+  staSuspended=prefs.getBool("stafail",false);
+  if (!homeSsid.isEmpty() && !staSuspended) {
+    staRetryPending=true;
+    staJoinAt=millis()+BOOT_JOIN_GRACE_MS;
+    Serial.println("[wifi] AP-first startup; home Wi-Fi joins after 15 seconds");
+    configTime(0,0,"pool.ntp.org","time.google.com");
+  }
+  if (staSuspended) Serial.println("[wifi] Recovery boot: STA disabled after prior timeout; reconfigure from web dashboard");
   setupWebserver();
 
   sampleQueue = xQueueCreate(SENSOR_QUEUE_DEPTH, sizeof(Sample));
@@ -503,14 +587,6 @@ void loop() {
     Sample s;
     while (xQueueReceive(sampleQueue, &s, 0) == pdPASS) appendRecord(s);
   }
-  if (reconnectNeeded && static_cast<int32_t>(millis() - reconnectAt) >= 0) {
-    reconnectNeeded = false;
-    startStation();
-    if (!homeSsid.isEmpty()) configTime(0, 0, "pool.ntp.org", "time.google.com");
-  }
-  if (!homeSsid.isEmpty() && WiFi.status() != WL_CONNECTED &&
-      static_cast<int32_t>(millis() - nextWifiRetry) >= 0 && !reconnectNeeded) {
-    startStation();
-  }
+  serviceWifi();
   delay(3);
 }
