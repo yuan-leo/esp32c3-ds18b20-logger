@@ -31,6 +31,20 @@ class SourceTests(unittest.TestCase):
         self.assertIn('0x210000, 0x1f0000', PART)
         self.assertEqual(0x210000+0x1f0000, 0x400000)
 
+    def test_wifi_tx_power_capped_in_all_modes(self):
+        self.assertIn('TX_POWER_LIMIT = WIFI_POWER_8_5dBm', MAIN)
+        self.assertIn('TX_POWER_LIMIT_DBM = 8.5f', MAIN)
+        self.assertIn('WiFi.setTxPower(TX_POWER_LIMIT)', MAIN)
+        self.assertIn('WiFi.getTxPower()', MAIN)
+        for scenario in ('boot: AP mode enabled', 'boot: AP started',
+                         'AP-only mode', 'AP-only recovery',
+                         'AP+STA mode enabled', 'station join started',
+                         'AP restored', 'periodic TX cap check'):
+            self.assertIn(scenario, MAIN)
+        self.assertIn('wifi_tx_limit_dbm', MAIN)
+        self.assertIn('wifi_tx_reported_dbm', MAIN)
+        self.assertIn('id="txPower"', HTML)
+
     def test_script_matches_offsets(self):
         script=(ROOT/'scripts/make_factory.py').read_text()
         for address in ('0x0', '0x8000', '0x10000'):

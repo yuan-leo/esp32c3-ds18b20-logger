@@ -2,6 +2,12 @@
 
 Local-only ESP32-C3 temperature logger with a responsive Wi-Fi dashboard, interactive graph, CSV export, and persistent flash log. One reading every **5 seconds**. Designed for ESP32-C3 boards with **4 MB flash**.
 
+## Lower Wi-Fi transmit power (generic ESP32-C3 stability)
+
+The firmware **caps both hotspot (AP) and home-network (STA) Wi-Fi transmission at 8.5 dBm** instead of allowing the default high TX setting. This conservative setting is an empirical workaround reported for poorly designed ESP32-C3 Super Mini boards, **not an Espressif-certified universal safe value**. It does not fix a faulty antenna, defective voltage regulator, or inadequate power supply.
+
+The cap is set after every AP/STA mode transition and checked regularly so reconnection cannot silently restore the high setting. Inspect **Wi-Fi TX power cap** on the dashboard or `/api/status`; the driver reports the configured limit, **not directly measured RF output**. If range is insufficient and hardware is stable, change `WIFI_POWER_8_5dBm` to `WIFI_POWER_11dBm` in `src/main.cpp`, update the matching `TX_POWER_LIMIT_DBM` numeric constant to `11.0f`, then rebuild. Keep the ESP32 and phone/router reasonably close during initial testing.
+
 ## Wiring
 
 | DS18B20 | ESP32-C3 |

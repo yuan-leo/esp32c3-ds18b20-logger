@@ -48,6 +48,7 @@ input{display:block;width:100%;padding:10px;margin-top:5px;border:1px solid #3e6
 <span>Home Wi-Fi</span><strong id="wifi">--</strong>
 <span>LAN address</span><strong id="ip">--</strong>
 <span>Hotspot</span><strong id="hotspot">--</strong>
+<span>Wi-Fi TX power cap</span><strong id="txPower">--</strong>
 <span>Lost samples</span><strong id="lost">--</strong>
 </div></section>
 <section class="card"><h2>Home Wi-Fi setup</h2>
@@ -106,6 +107,7 @@ async function getStatus(){
  el('wifi').textContent=s.wifi_connected?s.wifi_ssid:'Not connected';
  el('ip').textContent=s.wifi_connected?'http://'+s.sta_ip+'/':'--';
  el('hotspot').textContent=s.ap_ssid+' ('+s.ap_ip+')';
+ el('txPower').textContent=s.wifi_tx_limit_dbm+' dBm max (reported '+s.wifi_tx_reported_dbm+' dBm)'+(s.wifi_tx_cap_ok?'':' — check firmware log');
  el('lost').textContent=s.dropped+(s.fs_ok?'':' — storage error')
  }catch(e){el('conn').textContent='Logger unreachable'}
 }

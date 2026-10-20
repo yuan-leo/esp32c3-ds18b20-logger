@@ -30,7 +30,12 @@ constexpr char AP_PASSWORD[] = "TempLog1234";
 constexpr uint32_t BOOT_JOIN_GRACE_MS = 15000; // Recovery AP is accessible before joining home Wi-Fi.
 constexpr uint32_t STA_JOIN_TIMEOUT_MS = 22000;
 constexpr uint32_t AP_CHECK_INTERVAL_MS = 8000;
-constexpr char FIRMWARE_VERSION[] = "1.1.0-wifi-recovery";
+// Common conservative workaround for unreliable generic ESP32-C3 Super Mini RF layouts.
+// 8.5 dBm is a maximum requested by the driver, not measured radiated power.
+// For more range on a verified stable board, WIFI_POWER_11dBm is an alternative.
+constexpr wifi_power_t TX_POWER_LIMIT = WIFI_POWER_8_5dBm;
+constexpr float TX_POWER_LIMIT_DBM = 8.5f;
+constexpr char FIRMWARE_VERSION[] = "1.2.0-low-tx-power";
 
 // The fixed 8-byte binary format must not be changed without a migration.
 struct __attribute__((packed)) Sample {
@@ -68,6 +73,8 @@ uint32_t staJoinAt = 0;
 uint32_t staConnectStarted = 0;
 uint32_t lastApCheckAt = 0;
 uint32_t lastWifiLogAt = 0;
+bool txPowerCapOK = false;
+uint32_t txPowerSetFailures = 0;
 
 void startStation();
 void enterApOnly(bool rememberFailure);
@@ -301,6 +308,11 @@ void onStatus() {
   body += ",\"ap_stops\":" + String(apStops);
   body += ",\"sta_suspended\":" + String(staSuspended ? "true":"false");
   body += ",\"sta_disconnect_reason\":" + String(lastStaDisconnectReason);
+  body += ",\"wifi_tx_limit_dbm\":" + String(TX_POWER_LIMIT_DBM, 1);
+  body += ",\"wifi_tx_reported_dbm\":" + String(static_cast<int>(WiFi.getTxPower()) / 4.0f, 1);
+  body += ",\"wifi_tx_cap_ok\":";
+  body += txPowerCapOK ? "true" : "false";
+  body += ",\"wifi_tx_set_failures\":" + String(txPowerSetFailures);
   body += '}';
   responseJSON(body);
 }
@@ -442,6 +454,17 @@ void onClearLog() {
   responseJSON("{\"ok\":true}");
 }
 
+void enforceTxPower(const char *stage) {
+  // A setTxPower call before Wi-Fi startup fails; callers invoke after enabling
+  // the driver or AP. Read back the driver cap to detect refused changes.
+  const bool accepted = WiFi.setTxPower(TX_POWER_LIMIT);
+  const float reported = static_cast<int>(WiFi.getTxPower()) / 4.0f;
+  txPowerCapOK = accepted && reported <= TX_POWER_LIMIT_DBM + 0.1f;
+  if (!txPowerCapOK) ++txPowerSetFailures;
+  Serial.printf("[wifi] %s: TX cap requested %.1f dBm; driver reports %.1f dBm; %s\n",
+    stage, TX_POWER_LIMIT_DBM, reported, txPowerCapOK ? "OK" : "FAILED");
+}
+
 void wifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_AP_START:
@@ -468,9 +491,11 @@ void enterApOnly(bool rememberFailure) {
   if (rememberFailure) prefs.putBool("stafail", true);
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
+  enforceTxPower("AP-only mode");
   if (!apRunning) {
     WiFi.softAP(apName.c_str(), AP_PASSWORD, 1, 0, 4);
   }
+  enforceTxPower("AP-only recovery");
 }
 void startStation() {
   if (homeSsid.isEmpty() || staSuspended) return;
@@ -480,8 +505,11 @@ void startStation() {
   staRetryPending = false;
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
+  enforceTxPower("AP+STA mode enabled");
   if (!apRunning) WiFi.softAP(apName.c_str(), AP_PASSWORD, 1, 0, 4);
+  enforceTxPower("AP+STA ready");
   WiFi.begin(homeSsid.c_str(), homePassword.c_str());
+  enforceTxPower("station join started");
   staConnecting = true;
   staConnectStarted = millis();
 }
@@ -501,6 +529,12 @@ void serviceWifi() {
     if (!apRunning && WiFi.getMode()!=WIFI_MODE_NULL) {
       Serial.println("[wifi] Restoring missing AP");
       WiFi.softAP(apName.c_str(), AP_PASSWORD, 1, 0, 4);
+      enforceTxPower("AP restored");
+    }
+    // Re-assert the cap if a mode transition or driver event reset it.
+    if (WiFi.getMode()!=WIFI_MODE_NULL &&
+        (int)WiFi.getTxPower() > (int)TX_POWER_LIMIT) {
+      enforceTxPower("periodic TX cap check");
     }
     if ((uint32_t)(now-lastWifiLogAt)>30000) {
       lastWifiLogAt=now;
@@ -559,10 +593,12 @@ void setup() {
   WiFi.onEvent(wifiEvent);
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
+  enforceTxPower("boot: AP mode enabled");
   WiFi.setHostname("temp-logger");
   if (!WiFi.softAP(apName.c_str(), AP_PASSWORD, 1, 0, 4)) {
     Serial.println("ERROR: Could not create access point");
   }
+  enforceTxPower("boot: AP started");
   Serial.printf("Wi-Fi SSID: %s | password: %s | URL: http://%s/\n",
                 apName.c_str(), AP_PASSWORD, WiFi.softAPIP().toString().c_str());
   staSuspended=prefs.getBool("stafail",false);
